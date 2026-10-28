@@ -1,0 +1,865 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "net/http"
+require "json"
+require "uri"
+require "yaml"
+require "optparse"
+require "fileutils"
+require "socket"
+
+module Adminka
+  def self.config_dir
+    base = ENV["XDG_CONFIG_HOME"] || File.expand_path("~/.config")
+    File.join(base, "adminka")
+  end
+
+  CONFIG_FILE = File.join(config_dir, "config.yml")
+
+  class Config
+    def self.load
+      url = ENV["ADMINKA_URL"]
+      token = ENV["ADMINKA_TOKEN"]
+
+      if (url.nil? || token.nil?) && File.exist?(CONFIG_FILE)
+        config = YAML.load_file(CONFIG_FILE)
+        url ||= config["url"]
+        token ||= config["token"]
+      end
+
+      { url: url, token: token }
+    end
+
+    def self.save(url, token)
+      FileUtils.mkdir_p(Adminka.config_dir)
+      File.write(CONFIG_FILE, YAML.dump("url" => url, "token" => token))
+      File.chmod(0600, CONFIG_FILE)
+    end
+  end
+
+  class Client
+    def self.connect!
+      client = new
+      abort "Not configured. Run: adminka login" unless client.configured?
+      client
+    end
+
+    def initialize
+      config = Config.load
+      @base_url = config[:url]
+      @token = config[:token]
+    end
+
+    def configured?
+      @base_url && @token
+    end
+
+    def get(path, params = {})
+      uri = URI("#{@base_url}/api#{path}")
+      uri.query = URI.encode_www_form(params) unless params.empty?
+
+      request = Net::HTTP::Get.new(uri)
+      request["Authorization"] = "Bearer #{@token}"
+
+      execute(uri, request)
+    end
+
+    def post(path, body = {})
+      uri = URI("#{@base_url}/api#{path}")
+      request = Net::HTTP::Post.new(uri, "Content-Type" => "application/json")
+      request["Authorization"] = "Bearer #{@token}"
+      request.body = body.to_json
+
+      execute(uri, request)
+    end
+
+    def patch(path, body = {})
+      uri = URI("#{@base_url}/api#{path}")
+      request = Net::HTTP::Patch.new(uri, "Content-Type" => "application/json")
+      request["Authorization"] = "Bearer #{@token}"
+      request.body = body.to_json
+
+      execute(uri, request)
+    end
+
+    private
+
+    def execute(uri, request)
+      response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https") do |http|
+        http.request(request)
+      end
+
+      case response.code.to_i
+      when 200, 201
+        JSON.parse(response.body)
+      when 204
+        nil
+      when 401
+        abort "Error: Unauthorized. Check your token."
+      when 422
+        data = JSON.parse(response.body) rescue {}
+        errors = Array(data["errors"]).join(", ")
+        abort "Error: Validation failed — #{errors.empty? ? data : errors}"
+      else
+        abort "Error: HTTP #{response.code} — #{response.body}"
+      end
+    end
+  end
+
+  module Formatters
+    def self.table(headers, rows)
+      return "No results." if rows.empty?
+
+      widths = headers.each_with_index.map do |h, i|
+        [ h.to_s.length, *rows.map { |r| r[i].to_s.length } ].max
+      end
+
+      sep = widths.map { |w| "-" * w }.join("-+-")
+      fmt = widths.map { |w| "%-#{w}s" }.join(" | ")
+
+      lines = []
+      lines << fmt % headers
+      lines << sep
+      rows.each { |r| lines << fmt % r }
+      lines.join("\n")
+    end
+
+    def self.truncate(str, max = 50)
+      str = str.to_s.gsub(/\s+/, " ").strip
+      str.length > max ? "#{str[0...max - 3]}..." : str
+    end
+
+    def self.plain_text(value)
+      text = case value
+      when Hash then value["body"] || ""
+      when String then value
+      else value.to_s
+      end
+      text.gsub(/<[^>]+>/, " ").gsub(/\s+/, " ").strip
+    end
+  end
+
+  module Commands
+    STATE_FLOW = {
+      "open"        => "classify",
+      "classified"  => "assign",
+      "assigned"    => "process",
+      "in_progress" => "resolve",
+      "finished"    => "close",
+      "closed"      => nil
+    }.freeze
+
+    # Resulting state for each supported transition event (deterministic per the state machine).
+    EVENT_RESULT = {
+      "classify" => "classified",
+      "assign"   => "assigned",
+      "process"  => "in_progress",
+      "resolve"  => "finished",
+      "close"    => "closed"
+    }.freeze
+
+    def self.parse_options(args, banner)
+      json = false
+      parser = OptionParser.new do |opts|
+        opts.banner = banner
+        opts.on("--json", "Output as JSON") { json = true }
+        yield opts if block_given?
+      end
+      parser.parse!(args)
+      json
+    end
+
+    def self.output(data, json)
+      if json
+        puts JSON.pretty_generate(data)
+        true
+      end
+    end
+
+    def self.fetch(path, json, params = {})
+      data = Client.connect!.get(path, params)
+      return [ nil, true ] if output(data, json)
+
+      [ data, false ]
+    end
+
+    # Performs a PATCH /tickets/:id state transition.
+    # extra: additional keys merged into the ticket payload (e.g. type, sla_id).
+    def self.transition(ticket_id, event, extra, json)
+      abort "Ticket ID required." unless ticket_id
+
+      payload = { state_event: event }.merge(extra)
+      # A successful transition returns 204 No Content; the resulting state is
+      # deterministic per event (the API serves a stale cached body on read-back).
+      Client.connect!.patch("/tickets/#{ticket_id}", { ticket: payload })
+
+      state = EVENT_RESULT[event] || event
+      if json
+        puts JSON.pretty_generate("id" => ticket_id, "event" => event, "state" => state)
+      else
+        puts "Ticket ##{ticket_id} → #{state}"
+      end
+    end
+
+    def self.login(args)
+      url = nil
+      token = nil
+      name = "Adminka CLI on #{Socket.gethostname}"
+      parser = OptionParser.new do |opts|
+        opts.banner = "Usage: adminka login --url URL [--token TOKEN] [--name NAME]"
+        opts.on("--url URL", "Base URL (e.g. https://app.it-premium.com.ua)") { |v| url = v.chomp("/") }
+        opts.on("--token TOKEN", "Legacy API authentication token") { |v| token = v }
+        opts.on("--name NAME", "Name shown on the authorized API token") { |v| name = v }
+      end
+      parser.parse!(args)
+
+      unless url
+        print "URL (e.g. https://app.it-premium.com.ua): "
+        url = $stdin.gets&.strip&.chomp("/")
+      end
+
+      abort "URL is required." if url.nil? || url.empty?
+
+      if token && !token.empty?
+        Config.save(url, token)
+        puts "Saved config to #{CONFIG_FILE}"
+      else
+        device_login(url, name)
+      end
+    end
+
+    def self.device_login(url, name)
+      start = post_json("#{url}/api/device_authorizations", { name: name })
+      verification_url = start.fetch("verification_url")
+      user_code = start.fetch("user_code")
+      device_code = start.fetch("device_code")
+      interval = [ start.fetch("interval").to_i, 1 ].max
+      expires_at = Time.now + start.fetch("expires_in").to_i
+
+      puts "Open this URL and confirm access:"
+      puts verification_url
+      puts
+      puts "Code: #{user_code}"
+      puts "Waiting for confirmation..."
+
+      while Time.now < expires_at
+        sleep interval
+
+        response = post_json("#{url}/api/device_authorizations/token", { device_code: device_code }, allow_errors: true)
+        case response["error"]
+        when nil
+          Config.save(url, response.fetch("access_token"))
+          puts "Saved config to #{CONFIG_FILE}"
+          return
+        when "authorization_pending"
+          interval = [ response["interval"].to_i, interval, 1 ].max
+        when "slow_down"
+          interval = [ response["interval"].to_i, interval + 5, 1 ].max
+        when "expired_token"
+          abort "Login expired. Run: adminka login"
+        when "access_denied"
+          abort "Login denied."
+        else
+          abort "Login failed: #{response["error"] || response}"
+        end
+      end
+
+      abort "Login expired. Run: adminka login"
+    end
+
+    def self.post_json(url, body, allow_errors: false)
+      uri = URI(url)
+      request = Net::HTTP::Post.new(uri, "Content-Type" => "application/json", "Accept" => "application/json")
+      request.body = body.to_json
+
+      response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https") do |http|
+        http.request(request)
+      end
+      data = JSON.parse(response.body) rescue {}
+
+      return data if [ 200, 201 ].include?(response.code.to_i)
+      return data if allow_errors && data["error"]
+
+      abort "Error: HTTP #{response.code} — #{response.body}"
+    end
+
+    def self.tickets(args)
+      filter = "opened"
+      page = nil
+      per_page = nil
+      json = parse_options(args, "Usage: adminka tickets [options]") do |opts|
+        opts.on("--opened", "Show opened tickets (default)") { filter = "opened" }
+        opts.on("--my", "Show my assigned tickets") { filter = "my" }
+        opts.on("--unassigned", "Show unassigned tickets") { filter = "unassigned" }
+        opts.on("--unclassified", "Show unclassified tickets") { filter = "unclassified" }
+        opts.on("--outdoor", "Show outdoor tickets") { filter = "outdoor" }
+        opts.on("--page N", Integer, "Page number") { |v| page = v }
+        opts.on("--per-page N", Integer, "Items per page (default: 25)") { |v| per_page = v }
+      end
+
+      params = {}
+      params[:page] = page if page
+      params[:per_page] = per_page if per_page
+
+      data = Client.connect!.get("/tickets/#{filter}", params)
+      return if output(data, json)
+
+      tickets = data.is_a?(Hash) && data["tickets"] ? data["tickets"] : Array(data)
+      meta = data.is_a?(Hash) ? data["meta"] : nil
+
+      rows = tickets.map do |t|
+        [
+          t["id"],
+          t["type"] || "-",
+          Formatters.truncate(t.dig("client", "name") || "-", 20),
+          t["state_name"] || t["human_state_name"],
+          t.dig("rfc_status", "human_state_name") || t.dig("rfc_status", "state_name") || "-",
+          t.dig("change", "state_name") || t.dig("change", "human_state_name") || "-",
+          Formatters.truncate(Formatters.plain_text(t["description"]), 40),
+          t.dig("assigned_to", "name") || "-",
+          t["created_at"]&.then { |d| d[0..9] } || "-"
+        ]
+      end
+
+      headers = [ "ID", "Type", "Client", "Ticket State", "RFC Status", "Change", "Description", "Assignee", "Created" ]
+      puts Formatters.table(headers, rows)
+
+      if meta
+        puts "\nPage #{meta['page']} of #{meta['total_pages']} (#{meta['total_count']} total)"
+      end
+    end
+
+    def self.ticket(args)
+      json = parse_options(args, "Usage: adminka ticket ID [options]")
+      id = args.shift
+      abort "Ticket ID required. Usage: adminka ticket ID" unless id
+
+      data = Client.connect!.get("/tickets/#{id}")
+      return if output(data, json)
+
+      puts "Ticket ##{data['id']}"
+      puts "  Type:        #{data['type'] || '-'}"
+      puts "  Ticket State: #{data['human_state_name'] || data['state_name']}"
+      if data["type"] == "Rfc"
+        puts "  RFC Status:   #{data.dig('rfc_status', 'human_state_name') || data.dig('rfc_status', 'state_name') || '-'}"
+        puts "  Change:      #{data.dig('change', 'human_state_name') || data.dig('change', 'state_name') || '-'}"
+      end
+      puts "  Source:      #{data['source'] || '-'}"
+      puts "  Client:      #{data.dig('client', 'name') || '-'}"
+      puts "  Employee:    #{data.dig('employee', 'name') || '-'}"
+      puts "  Assigned to: #{data.dig('assigned_to', 'name') || '-'}"
+      puts "  Created:     #{data['created_at']}"
+      puts "  Updated:     #{data['updated_at']}"
+      puts "  URL:         #{data['url']}" if data["url"]
+
+      if data["response_at"]
+        puts "  Response by: #{data['response_at']}"
+        puts "  Responded:   #{data['is_responded'] ? 'Yes' : 'No'}"
+      end
+      if data["resolve_at"]
+        puts "  Resolve by:  #{data['resolve_at']}"
+      end
+      if data["is_paused"]
+        puts "  Paused till: #{data['paused_till']}"
+      end
+
+      next_action = STATE_FLOW[data["state_name"]]
+      puts "  Next action: #{next_action}" if next_action
+
+      puts ""
+      puts "Description:"
+      puts "  #{Formatters.plain_text(data['description'])}"
+
+      if data["activities"]&.any?
+        puts ""
+        puts "Activities (#{data['activities'].size}):"
+        data["activities"].each do |a|
+          author = a["author"].is_a?(Hash) ? a.dig("author", "name") : a["author"].to_s
+          author = a["author_type"] || "?" if author.empty?
+          body = Formatters.plain_text(a['description'] || a['body'] || '')
+          puts "  [#{a['created_at']&.then { |d| d[0..15] }}] #{author}: #{Formatters.truncate(body, 60)}"
+        end
+      end
+    end
+
+    def self.clients(args)
+      json = parse_options(args, "Usage: adminka clients [options]")
+      data = Client.connect!.get("/clients")
+      return if output(data, json)
+
+      rows = Array(data).map do |c|
+        [ c["id"], c["name"] || "-" ]
+      end
+
+      puts Formatters.table(%w[ID Name], rows)
+    end
+
+    def self.slas(args)
+      json = parse_options(args, "Usage: adminka slas CLIENT_ID")
+      client_id = args.shift
+      abort "Client ID required. Usage: adminka slas CLIENT_ID" unless client_id
+
+      data, handled = fetch("/clients/#{client_id}/slas", json)
+      return if handled
+
+      rows = Array(data).map do |s|
+        [ s["id"], s["service_id"] || "-", Formatters.truncate(s["name"] || "-", 30), s.dig("level", "name") || "-",
+          s["response_time"] || "-", s["resolve_time"] || "-" ]
+      end
+      puts Formatters.table(%w[ID ServiceID Service Level Response Resolve], rows)
+    end
+
+    def self.employees(args)
+      json = parse_options(args, "Usage: adminka employees CLIENT_ID")
+      client_id = args.shift
+      abort "Client ID required. Usage: adminka employees CLIENT_ID" unless client_id
+
+      data, handled = fetch("/clients/#{client_id}/employees", json)
+      return if handled
+
+      rows = Array(data).map { |e| [ e["id"], Formatters.truncate(e["name"] || "-", 40) ] }
+      puts Formatters.table(%w[ID Name], rows)
+    end
+
+    def self.agents(args)
+      json = parse_options(args, "Usage: adminka agents [options]")
+      data = Client.connect!.get("/agents")
+      return if output(data, json)
+
+      rows = Array(data).map do |a|
+        [
+          a["id"],
+          a["name"] || "-",
+          a["is_queueable"] ? "yes" : "no",
+          "#{a['duration'] || 0} min",
+          "#{a['travel_duration'] || 0} min"
+        ]
+      end
+
+      puts Formatters.table(%w[ID Name Queueable Duration Travel], rows)
+    end
+
+    def self.counters(args)
+      json = parse_options(args, "Usage: adminka counters [options]")
+      data = Client.connect!.get("/tickets/counters")
+      return if output(data, json)
+
+      puts "Ticket Counters"
+      puts "  Incidents:        #{data['incidents'] || 0}"
+      puts "  Service Requests: #{data['service_requests'] || 0}"
+      puts "  RFCs:             #{data['rfcs'] || 0}"
+      puts "  Feedbacks:        #{data['feedbacks'] || 0}"
+      puts "  Problems:         #{data['problems'] || 0}"
+      puts "  My Total:         #{data['total'] || 0}"
+    end
+
+    def self.time_logs(args)
+      from = nil
+      to = nil
+      ticket_id = nil
+      client_id = nil
+      employee_id = nil
+      service_id = nil
+      ticket_type = nil
+      group_by = nil
+      page = nil
+      per_page = nil
+
+      json = parse_options(args, "Usage: adminka time-logs --from YYYY-MM-DD --to YYYY-MM-DD [options]") do |opts|
+        opts.on("--from DATE", "Start date, inclusive (required)") { |v| from = v }
+        opts.on("--to DATE", "End date, inclusive (required)") { |v| to = v }
+        opts.on("--ticket-id ID", Integer, "Filter by ticket ID") { |v| ticket_id = v }
+        opts.on("--client-id ID", Integer, "Filter by client ID") { |v| client_id = v }
+        opts.on("--employee-id ID", Integer, "Filter by the log author ID") { |v| employee_id = v }
+        opts.on("--service-id ID", Integer, "Filter by service ID") { |v| service_id = v }
+        opts.on("--ticket-type TYPE", "Filter by Incident, ServiceRequest, Rfc, Problem, Change, etc.") { |v| ticket_type = v }
+        opts.on("--group-by FIELDS", "Comma-separated: ticket_type,rfc_phase,change_state,employee,client,service") { |v| group_by = v }
+        opts.on("--page N", Integer, "Page number for raw output") { |v| page = v }
+        opts.on("--per-page N", Integer, "Raw records per page (default: 100)") { |v| per_page = v }
+      end
+
+      abort "--from and --to are required. Usage: adminka time-logs --from YYYY-MM-DD --to YYYY-MM-DD" unless from && to
+
+      params = { from: from, to: to }
+      { ticket_id: ticket_id, client_id: client_id, employee_id: employee_id, service_id: service_id,
+        ticket_type: ticket_type, group_by: group_by, page: page, per_page: per_page }.each do |key, value|
+        params[key] = value if value
+      end
+
+      data = Client.connect!.get("/time_logs", params)
+      return if output(data, json)
+
+      if data["groups"]
+        rows = data["groups"].map do |group|
+          [ group["ticket_type"] || "-", group["rfc_phase"] || "-", group["change_state"] || "-",
+            group.dig("employee", "name") || "-", group.dig("client", "name") || "-",
+            group.dig("service", "name") || "-", group["work_minutes"], group["travel_minutes"] ]
+        end
+        puts Formatters.table(%w[Type RFCPhase ChangeState Employee Client Service WorkMin TravelMin], rows)
+      else
+        rows = data.fetch("time_logs", []).map do |log|
+          [ log["date"], log.dig("ticket", "id") || "-", log["ticket_type"] || "-",
+            log.dig("employee", "name") || "-", log["work_minutes"], log["travel_minutes"] ]
+        end
+        puts Formatters.table(%w[Date Ticket Type Employee WorkMin TravelMin], rows)
+        meta = data["meta"]
+        puts "\nPage #{meta['page']} of #{meta['total_pages']} (#{meta['total_count']} total)" if meta
+      end
+    end
+
+    def self.ticket_history(args)
+      from = nil
+      to = nil
+      date_field = nil
+      type = nil
+      state = nil
+      client_id = nil
+      page = nil
+      per_page = nil
+
+      json = parse_options(args, "Usage: adminka ticket-history --from YYYY-MM-DD --to YYYY-MM-DD [options]") do |opts|
+        opts.on("--from DATE", "Start date, inclusive (required)") { |v| from = v }
+        opts.on("--to DATE", "End date, inclusive (required)") { |v| to = v }
+        opts.on("--date-field FIELD", "created or resolved (default: resolved)") { |v| date_field = v }
+        opts.on("--type TYPE", "Filter by Incident, ServiceRequest, Rfc, or Feedback") { |v| type = v }
+        opts.on("--state STATE", "Filter by open, classified, assigned, in_progress, finished, or closed") { |v| state = v }
+        opts.on("--client-id ID", Integer, "Filter by client ID") { |v| client_id = v }
+        opts.on("--page N", Integer, "Page number") { |v| page = v }
+        opts.on("--per-page N", Integer, "Items per page (default: 100)") { |v| per_page = v }
+      end
+
+      abort "--from and --to are required. Usage: adminka ticket-history --from YYYY-MM-DD --to YYYY-MM-DD" unless from && to
+
+      params = { from: from, to: to }
+      { date_field: date_field, type: type, state: state, client_id: client_id, page: page, per_page: per_page }.each do |key, value|
+        params[key] = value if value
+      end
+
+      data = Client.connect!.get("/tickets/history", params)
+      return if output(data, json)
+
+      rows = data.fetch("tickets", []).map do |t|
+        [
+          t["id"],
+          t["type"] || "-",
+          Formatters.truncate(t.dig("client", "name") || "-", 20),
+          Formatters.truncate(t.dig("service", "name") || "-", 20),
+          t["human_state"] || t["state"] || "-",
+          t.dig("assigned_to", "name") || "-",
+          t["created_at"]&.then { |d| d[0..9] } || "-",
+          t["resolved_at"]&.then { |d| d[0..9] } || "-",
+          t["triage_reverts_count"]
+        ]
+      end
+
+      headers = %w[ID Type Client Service State Assignee Created Resolved Reverts]
+      puts Formatters.table(headers, rows)
+
+      meta = data["meta"]
+      puts "\nPage #{meta['page']} of #{meta['total_pages']} (#{meta['total_count']} total)" if meta
+    end
+
+    def self.services(args)
+      status = nil
+      type = nil
+      category_id = nil
+      missing_description = false
+      missing_name = false
+      summary = false
+
+      json = parse_options(args, "Usage: adminka services [options]") do |opts|
+        opts.on("--status STATUS", "Filter by service status") { |v| status = v }
+        opts.on("--type TYPE", "Filter by service type") { |v| type = v }
+        opts.on("--category ID", Integer, "Filter by service category ID") { |v| category_id = v }
+        opts.on("--missing-description", "Show services without descriptions") { missing_description = true }
+        opts.on("--missing-name", "Show services without names") { missing_name = true }
+        opts.on("--summary", "Show catalog summary") { summary = true }
+      end
+
+      data = Client.connect!.get("/services")
+      services = Array(data)
+      services = services.select { |s| s["status"].to_s == status } if status
+      services = services.select { |s| s["stype"].to_s == type } if type
+      services = services.select { |s| s["service_category_id"].to_i == category_id } if category_id
+      services = services.select { |s| s["description"].to_s.strip.empty? } if missing_description
+      services = services.select { |s| s["name"].to_s.strip.empty? } if missing_name
+
+      if json
+        payload = summary ? service_catalog_summary(services) : services
+        return output(payload, json)
+      end
+
+      if summary
+        service_catalog_summary_text(services)
+        return
+      end
+
+      rows = services.map do |s|
+        [
+          s["id"],
+          Formatters.truncate(s["name"] || "-", 34),
+          s["status"] || "-",
+          s["stype"] || "-",
+          s["service_category_id"] || "-",
+          s["description"].to_s.strip.empty? ? "no" : "yes",
+          s["updated_at"]&.then { |d| d[0..9] } || "-"
+        ]
+      end
+
+      puts Formatters.table(%w[ID Name Status Type Category Description Updated], rows)
+      puts "\n#{services.size} services"
+    end
+
+    def self.service(args)
+      json = parse_options(args, "Usage: adminka service ID [options]")
+      id = args.shift
+      abort "Service ID required. Usage: adminka service ID" unless id
+
+      data = Client.connect!.get("/services/#{id}")
+      return if output(data, json)
+
+      puts "Service ##{data['id']}"
+      puts "  Name:        #{data['name'] || '-'}"
+      puts "  Status:      #{data['status'] || '-'}"
+      puts "  Type:        #{data['stype'] || '-'}"
+      puts "  Category ID: #{data['service_category_id'] || '-'}"
+      puts "  Created:     #{data['created_at'] || '-'}"
+      puts "  Updated:     #{data['updated_at'] || '-'}"
+      puts ""
+      puts "Description:"
+      description = Formatters.plain_text(data["description"])
+      puts "  #{description.empty? ? '-' : description}"
+    end
+
+    def self.service_catalog_summary(services)
+      {
+        total: services.size,
+        by_status: count_by(services, "status"),
+        by_type: count_by(services, "stype"),
+        by_category_id: count_by(services, "service_category_id"),
+        missing_name: services.count { |s| s["name"].to_s.strip.empty? },
+        missing_description: services.count { |s| s["description"].to_s.strip.empty? }
+      }
+    end
+
+    def self.service_catalog_summary_text(services)
+      summary = service_catalog_summary(services)
+      puts "Service Catalog"
+      puts "  Total:                #{summary[:total]}"
+      puts "  Missing names:        #{summary[:missing_name]}"
+      puts "  Missing descriptions: #{summary[:missing_description]}"
+      puts ""
+      puts "By status:"
+      summary[:by_status].each { |name, count| puts "  #{name}: #{count}" }
+      puts ""
+      puts "By type:"
+      summary[:by_type].each { |name, count| puts "  #{name}: #{count}" }
+      puts ""
+      puts "By category ID:"
+      summary[:by_category_id].each { |name, count| puts "  #{name}: #{count}" }
+    end
+
+    def self.count_by(items, key)
+      items.group_by { |item| item[key].to_s.empty? ? "(empty)" : item[key].to_s }
+           .transform_values(&:size)
+           .sort_by { |name, count| [ -count, name ] }
+           .to_h
+    end
+
+    def self.create_ticket(args)
+      description = nil
+      employee_id = nil
+      source = nil
+      json = parse_options(args, "Usage: adminka create-ticket --description TEXT [options]") do |opts|
+        opts.on("--description TEXT", "Ticket description (required)") { |v| description = v }
+        opts.on("--employee-id ID", "Employee ID (determines client)") { |v| employee_id = v }
+        opts.on("--source SOURCE", "Source (phone, email, portal, etc.)") { |v| source = v }
+      end
+
+      abort "Description required. Usage: adminka create-ticket --description TEXT" unless description
+
+      ticket = { description: description }
+      ticket[:employee_id] = employee_id if employee_id
+      ticket[:source] = source if source
+
+      data = Client.connect!.post("/tickets", { ticket: ticket })
+      return if output(data, json)
+
+      puts "Created ticket ##{data['id']}"
+      puts "  URL: #{data['url']}" if data["url"]
+    end
+
+    def self.comment(args)
+      ticket_id = nil
+      text = nil
+      json = parse_options(args, "Usage: adminka comment TICKET_ID --text TEXT [options]") do |opts|
+        opts.on("--text TEXT", "Comment text (required)") { |v| text = v }
+      end
+
+      ticket_id = args.shift
+      abort "Ticket ID required. Usage: adminka comment TICKET_ID --text TEXT" unless ticket_id
+      abort "Comment text required. Usage: adminka comment #{ticket_id} --text TEXT" unless text
+
+      data = Client.connect!.post("/tickets/#{ticket_id}/activities", { activity: { name: text } })
+      return if output(data, json)
+
+      puts "Comment added to ticket ##{ticket_id}"
+      puts "  Author: #{data['author']}"
+      puts "  Created: #{data['created_at']}"
+    end
+
+    def self.classify(args)
+      type = nil
+      sla = nil
+      service = nil
+      json = parse_options(args, "Usage: adminka classify TICKET_ID --type TYPE [--sla SLA_ID | --service SERVICE_ID]") do |opts|
+        opts.on("--type TYPE", "Incident, ServiceRequest, Rfc, or Feedback") { |v| type = v }
+        opts.on("--sla SLA_ID", "SLA id (see: adminka slas CLIENT_ID); not needed for Feedback") { |v| sla = v }
+        opts.on("--service SERVICE_ID", "Service id — the server resolves the client's SLA; alternative to --sla") { |v| service = v }
+      end
+
+      ticket_id = args.shift
+      abort "Ticket ID required. Usage: adminka classify TICKET_ID --type TYPE [--sla SLA_ID | --service SERVICE_ID]" unless ticket_id
+      abort "Type required. Usage: adminka classify #{ticket_id} --type TYPE" unless type
+      valid = %w[Incident ServiceRequest Rfc Feedback]
+      abort "Invalid type '#{type}'. One of: #{valid.join(', ')}" unless valid.include?(type)
+      if type != "Feedback" && sla.nil? && service.nil?
+        abort "SLA or service required for #{type}. Usage: adminka classify #{ticket_id} --type #{type} (--sla SLA_ID | --service SERVICE_ID)"
+      end
+
+      extra = { type: type }
+      extra[:sla_id] = sla if sla
+      extra[:service_id] = service if service
+      transition(ticket_id, "classify", extra, json)
+    end
+
+    def self.assign(args)
+      assignee = nil
+      json = parse_options(args, "Usage: adminka assign TICKET_ID --to USER_ID") do |opts|
+        opts.on("--to USER_ID", "Agent/user id to assign (see: adminka agents)") { |v| assignee = v }
+      end
+
+      ticket_id = args.shift
+      abort "Ticket ID required. Usage: adminka assign TICKET_ID --to USER_ID" unless ticket_id
+      abort "Assignee required. Usage: adminka assign #{ticket_id} --to USER_ID" unless assignee
+
+      transition(ticket_id, "assign", { assigned_to_id: assignee }, json)
+    end
+
+    def self.process(args)
+      json = parse_options(args, "Usage: adminka process TICKET_ID")
+      ticket_id = args.shift
+      abort "Ticket ID required. Usage: adminka process TICKET_ID" unless ticket_id
+      transition(ticket_id, "process", {}, json)
+    end
+
+    def self.resolve(args)
+      json = parse_options(args, "Usage: adminka resolve TICKET_ID")
+      ticket_id = args.shift
+      abort "Ticket ID required. Usage: adminka resolve TICKET_ID" unless ticket_id
+      transition(ticket_id, "resolve", {}, json)
+    end
+
+    def self.close(args)
+      json = parse_options(args, "Usage: adminka close TICKET_ID")
+      ticket_id = args.shift
+      abort "Ticket ID required. Usage: adminka close TICKET_ID" unless ticket_id
+      transition(ticket_id, "close", {}, json)
+    end
+
+    def self.help(_args = [])
+      puts <<~HELP
+        adminka - CLI for IT-Premium service management
+
+        Usage: adminka COMMAND [options]
+
+        Commands:
+          login           Configure API URL and browser-confirmed API token
+          tickets         List tickets (--opened, --my, --unassigned, --unclassified, --outdoor, --page N, --per-page N)
+          ticket ID       Show ticket details (includes next available action)
+          create-ticket   Create a new ticket (--description TEXT, --employee-id ID, --source SOURCE)
+          comment         Add comment to a ticket (TICKET_ID --text TEXT)
+          classify        Classify a ticket (TICKET_ID --type TYPE [--sla SLA_ID | --service SERVICE_ID])
+          assign          Assign a ticket (TICKET_ID --to USER_ID)
+          process         Start work on a ticket (TICKET_ID)
+          resolve         Resolve a ticket (TICKET_ID)
+          close           Close a resolved ticket (TICKET_ID)
+          clients         List clients
+          slas            List a client's SLAs (CLIENT_ID)
+          employees       List a client's employees (CLIENT_ID)
+          agents          List agents with today's activity
+          counters        Show ticket counters overview
+          time-logs       Export bounded raw time logs or grouped reporting totals
+          ticket-history  Export historical tickets (any state, incl. resolved/closed) by date range
+          services        List service catalog entries
+          service ID      Show service catalog entry details
+          service-catalog Alias for services
+
+        Global options:
+          --json          Output as JSON (available on all commands)
+          --help          Show help for a command
+
+        Authentication:
+          1. Run: adminka login
+          2. Or set env vars: ADMINKA_URL and ADMINKA_TOKEN
+
+        Config: #{CONFIG_FILE}
+
+        Examples:
+          adminka login --url https://app.it-premium.com.ua
+          adminka login --url https://app.it-premium.com.ua --token LEGACY_TOKEN
+          adminka tickets --my
+          adminka ticket 12345
+          adminka counters --json
+          adminka time-logs --from 2026-06-01 --to 2026-06-30 --json
+          adminka time-logs --from 2026-06-01 --to 2026-06-30 --group-by ticket_type,rfc_phase,employee --json
+          adminka ticket-history --from 2026-06-01 --to 2026-08-31 --json
+          adminka ticket-history --from 2026-06-01 --to 2026-08-31 --date-field created --state closed --json
+          adminka services --summary
+          adminka services --missing-description
+          adminka service 1 --json
+          adminka create-ticket --description "Server down" --source phone
+          adminka comment 12345 --text "Working on it"
+          adminka classify 12345 --type Incident --service 7
+          adminka assign 12345 --to 45
+          adminka resolve 12345
+      HELP
+    end
+  end
+end
+
+command = ARGV.shift
+
+DISPATCH = {
+  "login"           => :login,
+  "tickets"         => :tickets,
+  "ticket"          => :ticket,
+  "create-ticket"   => :create_ticket,
+  "comment"         => :comment,
+  "classify"        => :classify,
+  "assign"          => :assign,
+  "process"         => :process,
+  "resolve"         => :resolve,
+  "close"           => :close,
+  "clients"         => :clients,
+  "slas"            => :slas,
+  "employees"       => :employees,
+  "agents"          => :agents,
+  "counters"        => :counters,
+  "time-logs"       => :time_logs,
+  "ticket-history"  => :ticket_history,
+  "services"        => :services,
+  "service-catalog" => :services,
+  "service"         => :service
+}.freeze
+
+if (meth = DISPATCH[command])
+  Adminka::Commands.public_send(meth, ARGV)
+elsif [ "help", "--help", "-h", nil ].include?(command)
+  Adminka::Commands.help
+else
+  puts "Unknown command: #{command}"
+  puts "Run 'adminka help' for usage."
+  exit 1
+end
