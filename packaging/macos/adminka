@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+bundle_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ ! -x /usr/bin/ruby ]; then
+  echo 'This macOS pilot requires /usr/bin/ruby. Contact the pilot coordinator.' >&2
+  exit 1
+fi
+# Use only Apple's runtime and standard library, not gems from a user's shell.
+unset RUBYOPT RUBYLIB GEM_HOME GEM_PATH
+exec /usr/bin/ruby --disable-gems -EUTF-8:UTF-8 "$bundle_dir/adminka.rb" "$@"

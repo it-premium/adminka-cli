@@ -2,6 +2,20 @@
 
 Command-line client for IT-Premium service management. This public repository contains the CLI and packaging tools; the Rails application is maintained separately.
 
+## macOS pilot
+
+[Download the macOS prerelease](https://github.com/it-premium/adminka-cli/releases/tag/macos-pilot-2026.10.28.1). This small script package uses `/usr/bin/ruby` supplied by macOS; it does not bundle a runtime. Keep the extracted folder intact and run `./adminka --help` from it. No Python, Rails checkout, gems or administrator installation is needed to run it on the tested Mac.
+
+Run the loopback-only test first:
+
+```sh
+/usr/bin/ruby --disable-gems -EUTF-8:UTF-8 ./smoke.rb
+```
+
+Then log in with `./adminka login --url https://app.it-premium.com.ua` and try `./adminka tickets --my`. See the release notes for the exact tested platform and limitations. This is an unsigned script archive, not a signed/notarized app. Claude/Gemini integration and real browser authorization remain unverified.
+
+Build from a committed checkout with `python3 packaging/macos/build.py /absolute/output/directory`. The builder requires Python 3; users of the package do not.
+
 ## Experimental Windows x64 pilot
 
 **Windows execution has not yet been verified.** This is a portable packaging experiment, not a production-ready Windows release.
