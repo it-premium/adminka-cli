@@ -46,10 +46,12 @@ Dir.mktmpdir("adminka smoke ") do |temp|
                      [200, { access_token: "OFFLINE_TEST_ONLY" }]
                    when "/api/tickets/my"
                      [200, { tickets: [{ id: 123, description: "Перевірка заявки" }] }]
+                   when "/api/activities/123"
+                     [204, nil]
                    else
                      [401, {}]
                    end
-      payload = JSON.generate(data)
+      payload = code == 204 ? "" : JSON.generate(data)
       socket.write("HTTP/1.1 #{code} Test\r\nContent-Type: application/json\r\nContent-Length: #{payload.bytesize}\r\nConnection: close\r\n\r\n#{payload}")
       socket.close
     end
@@ -65,11 +67,17 @@ Dir.mktmpdir("adminka smoke ") do |temp|
     raise "Unicode JSON failed: #{error}" unless status.success? && JSON.parse(output)["tickets"][0]["description"] == "Перевірка заявки"
     _, error, status = run.call("ticket", "999", "--json")
     raise "401 error failed" if status.success? || !error.include?("Unauthorized")
+    output, error, status = run.call("delete-comment", "123", "--json")
+    raise "DELETE failed: #{error}" unless status.success? && JSON.parse(output) == { "id" => 123, "deleted" => true }
+    _, error, status = run.call("delete-comment", "999", "--json")
+    raise "DELETE refusal failed" if status.success? || !error.include?("Unauthorized")
     seen = []
     seen << requests.pop until requests.empty?
     raise "Bearer token missing" unless seen.select { |req| req[0].start_with?("GET") }.all? { |req| req[1]["authorization"] == "Bearer OFFLINE_TEST_ONLY" }
+    deletion = seen.find { |req| req[0].start_with?("DELETE /api/activities/123 ") }
+    raise "Authenticated DELETE missing" unless deletion && deletion[1]["authorization"] == "Bearer OFFLINE_TEST_ONLY"
     raise "Device code missing" unless JSON.parse(seen[1][2])["device_code"] == "fake-device"
-    puts JSON.generate(status: "PASS", checks: ["relocated Unicode/spaced path", "help", "missing config", "mock device login", "config mode 0600", "Bearer authentication", "Unicode JSON", "401 nonzero exit"], untested: ["real browser authorization", "production API", "AI assistants", "other macOS versions/Intel"])
+    puts JSON.generate(status: "PASS", checks: ["relocated Unicode/spaced path", "help", "missing config", "mock device login", "config mode 0600", "Bearer authentication", "Unicode JSON", "401 nonzero exit", "authenticated DELETE", "DELETE refusal"], untested: ["real browser authorization", "production API", "AI assistants", "other macOS versions/Intel"])
   ensure
     worker.kill
     worker.join

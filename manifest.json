@@ -1,7 +1,7 @@
 {
   "status": "experimental; Windows execution unverified",
-  "source_revision": "e096212f3b770409f48f3163272ccd5229d62a1b",
-  "cli_sha256": "528c4df5fd554c8bc816827767eaf1ffdebf0a6ce30e0e1ac2866702551c77b5",
+  "source_revision": "1d3fe0d09d123457abd1b5532b01bd50736e1740",
+  "cli_sha256": "67e8d1dfc439f1bc9d632e4689baacc428289a2bb1fe7692d7b4f5e79f1d868b",
   "runtime_url": "https://github.com/oneclick/rubyinstaller2/releases/download/RubyInstaller-3.4.12-1/rubyinstaller-3.4.12-1-x64.7z",
   "runtime_sha256": "3806f164377824bcb17e1cf39b17d967e2bdc01e8547ce0254cd786dbe2cfe13",
   "runtime_version": "3.4.12-1"
