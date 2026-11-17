@@ -74,6 +74,13 @@ module Adminka
       execute(uri, request)
     end
 
+    def delete(path)
+      uri = URI("#{@base_url}/api#{path}")
+      request = Net::HTTP::Delete.new(uri)
+      request["Authorization"] = "Bearer #{@token}"
+      execute(uri, request)
+    end
+
     def patch(path, body = {})
       uri = URI("#{@base_url}/api#{path}")
       request = Net::HTTP::Patch.new(uri, "Content-Type" => "application/json")
@@ -690,6 +697,17 @@ module Adminka
       puts "  URL: #{data['url']}" if data["url"]
     end
 
+    def self.delete_comment(args)
+      json = parse_options(args, "Usage: adminka delete-comment ACTIVITY_ID [--json]")
+      activity_id = args.shift
+      abort "A positive activity ID is required" unless activity_id&.match?(/\A[1-9]\d*\z/) && args.empty?
+
+      Client.connect!.delete("/activities/#{activity_id}")
+      return if output({ "id" => activity_id.to_i, "deleted" => true }, json)
+
+      puts "Deleted comment ##{activity_id}"
+    end
+
     def self.comment(args)
       ticket_id = nil
       text = nil
@@ -779,6 +797,7 @@ module Adminka
           tickets         List tickets (--opened, --my, --unassigned, --unclassified, --outdoor, --page N, --per-page N)
           ticket ID       Show ticket details (includes next available action)
           create-ticket   Create a new ticket (--description TEXT, --employee-id ID, --source SOURCE)
+          delete-comment  Delete comment (ACTIVITY_ID; power roles only)
           comment         Add comment to a ticket (TICKET_ID --text TEXT)
           classify        Classify a ticket (TICKET_ID --type TYPE [--sla SLA_ID | --service SERVICE_ID])
           assign          Assign a ticket (TICKET_ID --to USER_ID)
@@ -836,6 +855,7 @@ DISPATCH = {
   "tickets"         => :tickets,
   "ticket"          => :ticket,
   "create-ticket"   => :create_ticket,
+  "delete-comment"  => :delete_comment,
   "comment"         => :comment,
   "classify"        => :classify,
   "assign"          => :assign,

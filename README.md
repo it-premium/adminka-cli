@@ -49,7 +49,7 @@ Deleting the extracted folder does not delete credentials stored separately unde
 
 ## Provenance
 
-The initial CLI is an exact copy from application revision `e096212f3b770409f48f3163272ccd5229d62a1b`. `manifest.json` records the CLI digest and RubyInstaller archive provenance. This repository has its own Git history; no Rails repository history is included.
+The current CLI is an exact copy from application revision `1d3fe0d09d123457abd1b5532b01bd50736e1740`. `manifest.json` records the CLI digest and RubyInstaller archive provenance. This repository has its own Git history; no Rails repository history is included.
 
 Packaging code is in `packaging/windows/`. Build from a clean committed checkout with Python 3 and `bsdtar`:
 
@@ -62,3 +62,11 @@ New builds record this distribution repository’s current commit as `source_rev
 ## Licensing
 
 See [NOTICES.md](NOTICES.md). Public availability is not an additional open-source license grant for the Adminka code.
+
+## Next release: comment deletion
+
+`adminka delete-comment ACTIVITY_ID [--json]` removes a non-automated comment
+for authorized power-role users. Obtain its ID with `adminka ticket TICKET_ID --json`.
+This requires the API from adminka-core PR #750 to be deployed on the target server.
+The existing October download links above do not include this command.
+Keep the next packages experimental; Windows execution remains unverified.
